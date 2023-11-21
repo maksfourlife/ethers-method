@@ -1,0 +1,15 @@
+[package]
+name = "ethers-method"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ethers-contract-derive = { version = "2.0.10", default-features = false }
+ethers-core = "2.0.10"
+ethers-providers = { version = "2.0.10", default-features = false }
+hex = "0.4.3"
+once_cell = "1.18.0"
+pin-project = "1.1.3"
+thiserror = "1.0.50"
