@@ -11,5 +11,4 @@ ethers-core = "2.0.10"
 ethers-providers = { version = "2.0.10", default-features = false }
 hex = "0.4.3"
 once_cell = "1.18.0"
-pin-project = "1.1.3"
 thiserror = "1.0.50"

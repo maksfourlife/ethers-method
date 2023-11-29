@@ -1,23 +1,18 @@
-use std::{
-    fmt::{self, Debug},
-    future::Future,
-    marker::PhantomData,
-    ops::Deref,
-    pin::Pin,
-    task::{ready, Context, Poll},
-};
-
 use ethers_contract_derive::{EthAbiCodec, EthAbiType};
 use ethers_core::{
     abi::{AbiDecode, AbiEncode, AbiError, AbiType, ParamType},
     types::{transaction::eip2718::TypedTransaction, Address, BlockId, Bytes, NameOrAddress, U256},
 };
-use ethers_providers::{spoof::State, Middleware, MiddlewareError};
+use ethers_providers::Middleware;
 use once_cell::sync::Lazy;
+use std::{
+    fmt::{self, Debug},
+    marker::PhantomData,
+    ops::Deref,
+};
 
 pub use ethers_core;
 pub use once_cell;
-use pin_project::pin_project;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error<M: Middleware> {
@@ -29,54 +24,48 @@ pub enum Error<M: Middleware> {
 
 #[derive(Clone, Copy)]
 pub struct Method<A, R> {
-    selector: &'static Lazy<[u8; 4]>,
-    args: Option<A>,
-    _debug_args: fn(&A, &mut fmt::Formatter<'_>) -> fmt::Result,
-    // _arg_names: &'static [&'static str],
-    _name: &'static str,
+    args: A,
+    vtable: &'static MethodVTable,
     _p: PhantomData<R>,
+}
+
+pub struct MethodVTable {
+    pub name: &'static str,
+    pub selector: Lazy<[u8; 4]>,
+    pub debug_args: unsafe fn(*const (), &mut fmt::Formatter<'_>) -> fmt::Result,
 }
 
 impl<A: fmt::Debug, R> fmt::Debug for Method<A, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Args<'a, A> {
             args: &'a A,
-            debug: fn(&'a A, &mut fmt::Formatter<'_>) -> fmt::Result,
+            debug: unsafe fn(*const (), &mut fmt::Formatter<'_>) -> fmt::Result,
         }
         impl<'a, A> fmt::Debug for Args<'a, A> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                (self.debug)(self.args, f)
+                unsafe { (self.debug)(self.args as *const A as *const (), f) }
             }
         }
         f.debug_struct("Method")
-            .field("selector", &hex::encode(self.selector.deref()))
+            .field("selector", &hex::encode(self.vtable.selector.deref()))
             .field(
                 "args",
-                &self.args.as_ref().map(|args| Args {
-                    args,
-                    debug: self._debug_args,
-                }),
+                &Args {
+                    args: &self.args,
+                    debug: self.vtable.debug_args,
+                },
             )
-            .field("_name", &self._name)
+            .field("_name", &self.vtable.name)
             .field("_p", &self._p)
             .finish()
     }
 }
 
 impl<A, R> Method<A, R> {
-    pub fn new(
-        _name: &'static str,
-        selector: &'static Lazy<[u8; 4]>,
-        // _arg_names: &'static [&'static str],
-        _debug_args: fn(&A, &mut fmt::Formatter<'_>) -> fmt::Result,
-        args: A,
-    ) -> Self {
+    pub fn new(vtable: &'static MethodVTable, args: A) -> Self {
         Self {
-            selector,
-            args: Some(args),
-            // _arg_names,
-            _debug_args,
-            _name,
+            args,
+            vtable,
             _p: PhantomData,
         }
     }
@@ -98,11 +87,11 @@ impl<A, R> Method<A, R> {
         }
     }
 
-    pub fn encode_args(&mut self) -> Vec<u8>
+    pub fn encode_args(self) -> Vec<u8>
     where
         A: AbiEncode,
     {
-        [self.selector.to_vec(), self.args.take().unwrap().encode()].concat()
+        [self.vtable.selector.to_vec(), self.args.encode()].concat()
     }
 }
 
@@ -134,10 +123,10 @@ impl<A, R> MethodTx<A, R> {
     {
         let data = self.method.encode_args();
         self.tx.set_data(data.into());
-        let data = provider.call(&self.tx, block).await.map_err(|e| {
-            dbg!(&e, &self.method);
-            Error::Middleware(e)
-        })?;
+        let data = provider
+            .call(&self.tx, block)
+            .await
+            .map_err(Error::Middleware)?;
         Ok(AbiDecode::decode(data)?)
     }
 
@@ -155,61 +144,6 @@ impl<A, R> MethodTx<A, R> {
             .estimate_gas(&self.tx, block)
             .await
             .map_err(Error::Middleware)
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn call_raw<'a, M: Middleware>(
-        &'a mut self,
-        provider: &'a M,
-    ) -> CallBuilder<'a, M, fn(Vec<u8>) -> Result<R, AbiError>>
-    where
-        A: AbiEncode,
-        R: AbiDecode,
-    {
-        let data = self.method.encode_args();
-        self.tx.set_data(data.into());
-        CallBuilder::new(provider.provider().call_raw(&self.tx), |data| {
-            R::decode(data)
-        })
-    }
-}
-
-#[pin_project]
-pub struct CallBuilder<'a, M: Middleware, F> {
-    #[pin]
-    builder: ethers_providers::CallBuilder<'a, M::Provider>,
-    f: F,
-}
-
-impl<'a, M: Middleware, F> CallBuilder<'a, M, F> {
-    pub fn new(builder: ethers_providers::CallBuilder<'a, M::Provider>, f: F) -> Self {
-        Self { builder, f }
-    }
-}
-
-impl<'a, M: Middleware, R> ethers_providers::RawCall<'a> for CallBuilder<'a, M, R> {
-    fn block(self, id: BlockId) -> Self {
-        let builder = self.builder.block(id);
-        Self::new(builder, self.f)
-    }
-
-    fn state(self, state: &'a State) -> Self {
-        let builder = self.builder.state(state);
-        Self::new(builder, self.f)
-    }
-}
-
-impl<'a, M: Middleware, F: Fn(Vec<u8>) -> Result<R, AbiError>, R> Future for CallBuilder<'a, M, F> {
-    type Output = Result<R, Error<M>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let data = ready!(this.builder.poll(cx));
-        Poll::Ready(
-            data.map_err(<M::Error as MiddlewareError>::from_provider_err)
-                .map_err(Error::<M>::Middleware)
-                .and_then(|data| (this.f)(data.to_vec()).map_err(Error::Abi)),
-        )
     }
 }
 
@@ -240,7 +174,7 @@ impl<A, R> MethodCall<A, R> {
         self
     }
 
-    pub fn into_raw(mut self) -> RawCall
+    pub fn into_raw(self) -> RawCall
     where
         A: AbiEncode,
     {
@@ -289,33 +223,45 @@ macro_rules! impl_method {
     ($alias:ident, $($vis: vis,)? $name:expr, $return_type:ty, $($arg_name:ident: $arg_type:ty),+) => {
         #[allow(unused, clippy::too_many_arguments)]
         $($vis)? fn $alias($($arg_name: $arg_type),+) -> $crate::Method<($($arg_type),+,), $return_type> {
-            use $crate::once_cell::sync::Lazy;
-            use $crate::ethers_core::abi::{short_signature, AbiType};
-            static SELECTOR: Lazy<[u8; 4]> = Lazy::new(|| {
-                short_signature($name, &[$(<$arg_type as AbiType>::param_type()),+])
-            });
-            // const ARG_NAMES: &[&str] = &[ $(stringify!($arg_name),)+ ];
-            // $crate::Method::new($name, &SELECTOR, ARG_NAMES, ($($arg_name),+,))
-            fn debug_args(args: &( $($arg_type),+ ,), f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                let ( $($arg_name),+ ,) = args;
+            use $crate::{
+                ethers_core::abi::{short_signature, AbiType},
+                once_cell::sync::Lazy,
+                Method, MethodVTable,
+            };
+            unsafe fn debug_args(args: *const (), f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let ( $($arg_name),+ ,) = &*(args as *const ($($arg_type),+,));
                 f.debug_struct("Args")
                     $(.field(stringify!($arg_name), $arg_name))+
                     .finish()
             }
-            $crate::Method::new($name, &SELECTOR, debug_args, ($($arg_name),+,))
+            static VTABLE: MethodVTable = MethodVTable {
+                selector: Lazy::new(|| {
+                    short_signature($name, &[$(<$arg_type as AbiType>::param_type()),+])
+                }),
+                debug_args,
+                name: $name
+            };
+            Method::new(&VTABLE, ($($arg_name),+,))
         }
     };
 
     ($alias:ident, $($vis: vis,)? $name:expr, $return_type:ty) => {
         #[allow(unused)]
         $($vis)? fn $alias() -> $crate::Method<$crate::Zst, $return_type> {
-            use $crate::once_cell::sync::Lazy;
-            use $crate::ethers_core::abi::{short_signature};
-            static SELECTOR: Lazy<[u8; 4]> = Lazy::new(|| short_signature($name, &[]));
-            fn debug_args(args: &$crate::Zst, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            use $crate::{
+                ethers_core::abi::{short_signature, AbiType},
+                once_cell::sync::Lazy,
+                Method, MethodVTable, Zst
+            };
+            fn debug_args(_args: *const (), f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.debug_struct("Args").finish()
             }
-            $crate::Method::new($name, &SELECTOR, debug_args, $crate::Zst)
+            static VTABLE: MethodVTable = MethodVTable {
+                selector: Lazy::new(|| short_signature($name, &[])),
+                debug_args,
+                name: $name
+            };
+            Method::new(&VTABLE, Zst)
         }
     };
 }
@@ -330,14 +276,14 @@ impl_method!(
 
 #[derive(Clone, Debug, Default)]
 pub struct Multicall<C> {
-    calls: Option<C>,
+    calls: C,
     tx: TypedTransaction,
 }
 
 impl<C: Calls> Multicall<C> {
     pub fn new(calls: C) -> Self {
         Self {
-            calls: Some(calls),
+            calls,
             tx: Default::default(),
         }
     }
@@ -357,7 +303,7 @@ impl<C: Calls> Multicall<C> {
         provider: &P,
         block: Option<BlockId>,
     ) -> Result<U256, P::Error> {
-        let calls = self.calls.take().unwrap().encode();
+        let calls = self.calls.encode();
         let data = multicall(calls).encode_args();
         self.tx.set_data(data.into());
         provider.estimate_gas(&self.tx, block).await
@@ -368,7 +314,7 @@ impl<C: Calls> Multicall<C> {
         provider: &P,
         block: Option<BlockId>,
     ) -> Result<(U256, C::Results), Error<P>> {
-        let calls = self.calls.take().unwrap().encode();
+        let calls = self.calls.encode();
         let value = calls
             .iter()
             .fold(U256::zero(), |value, call| value + call.value);
@@ -381,23 +327,6 @@ impl<C: Calls> Multicall<C> {
             .map_err(Error::Middleware)?;
         let (gas_used, results): (U256, Vec<RawResult>) = AbiDecode::decode(data)?;
         Ok((gas_used, C::decode(results)?))
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub fn call_raw<'a, M: Middleware>(
-        &'a mut self,
-        provider: &'a M,
-    ) -> CallBuilder<'a, M, fn(Vec<u8>) -> Result<C::Results, AbiError>> {
-        let calls = self.calls.take().unwrap().encode();
-        let value = calls
-            .iter()
-            .fold(U256::zero(), |value, call| value + call.value);
-        let data = multicall(calls).encode_args();
-        self.tx.set_data(data.into());
-        self.tx.set_value(value);
-        CallBuilder::new(provider.provider().call_raw(&self.tx), |data| {
-            C::decode(AbiDecode::decode(data)?)
-        })
     }
 }
 
@@ -469,11 +398,6 @@ macro_rules! impl_tuples {
 }
 
 impl_tuples!(
-    // 16: (A16, R16),
-    // 15: (A15, R15),
-    // 14: (A14, R14),
-    // 13: (A13, R13),
-    // 12: (A12, R12),
     11: (A11, R11),
     10: (A10, R10),
     9: (A9, R9),
@@ -494,7 +418,12 @@ mod test {
 
     #[test]
     fn test_args_debug() {
+        impl_method!(nonce, pub, "nonce", Zst);
+
         let method = multicall(vec![]);
+        dbg!(&method);
+
+        let method = nonce();
         dbg!(&method);
     }
 }
